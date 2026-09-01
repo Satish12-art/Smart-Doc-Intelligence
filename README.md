@@ -10,6 +10,7 @@
 An enterprise-grade **Hybrid Retrieval-Augmented Generation (RAG)** and **Document Intelligence Platform**. It enables semantic query matching, exact keyword retrieval, rank fusion, cross-encoder re-ranking, and grounded multi-format document Q&A with strict citations.
 
 ---
+Deployed App=https://smart-doc-intelligence-6pfzs6ddds5chzpom66kkk.streamlit.app/
 
 ## 📑 Table of Contents
 
