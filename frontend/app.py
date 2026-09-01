@@ -1,14 +1,25 @@
 import html
-import streamlit as st
-import requests
 import os
-import pandas as pd
-from typing import List, Dict, Any
-
-import subprocess
-import time
-import socket
 import sys
+from pathlib import Path
+from typing import List, Dict, Any
+import requests
+import pandas as pd
+import streamlit as st
+
+# Ensure project root is in sys.path
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+# Sync Streamlit Secrets to environment variables for seamless cloud deployment
+try:
+    if hasattr(st, "secrets"):
+        for k, v in st.secrets.items():
+            if isinstance(v, str) and k not in os.environ:
+                os.environ[k] = v
+except Exception:
+    pass
 
 # Page Configuration
 st.set_page_config(
@@ -21,43 +32,141 @@ st.set_page_config(
 # API Configurations
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 
-def is_backend_healthy(url="http://localhost:8000"):
+# Engine Bridge: Supports both Remote FastAPI Backend and Direct In-Process Engine
+@st.cache_resource
+def get_inprocess_engine():
+    """Initializes and caches backend services for zero-server in-process execution."""
     try:
-        r = requests.get(f"{url}/documents", timeout=1.0)
+        from backend.config import UPLOAD_DIR
+        from backend.services.document_processor import DocumentProcessor
+        from backend.services.search_engine import SearchEngine
+        from backend.services.reranker import Reranker
+        from backend.services.llm_service import LLMService
+        return {
+            "search_engine": SearchEngine(),
+            "reranker": Reranker(),
+            "llm_service": LLMService(),
+            "processor": DocumentProcessor,
+            "upload_dir": UPLOAD_DIR
+        }
+    except Exception as e:
+        st.error(f"Failed to initialize direct engine: {e}")
+        return None
+
+def check_remote_api() -> bool:
+    try:
+        r = requests.get(f"{BACKEND_URL}/documents", timeout=1.0)
         return r.status_code == 200
     except Exception:
         return False
 
-@st.cache_resource
-def ensure_backend_started():
-    """If running on local/Streamlit Cloud with default localhost URL, ensure backend is started."""
-    if "localhost" in BACKEND_URL or "127.0.0.1" in BACKEND_URL:
-        if not is_backend_healthy(BACKEND_URL):
-            # Run FastAPI backend in the background
-            subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            # Wait for backend to be ready
-            for _ in range(12):
-                if is_backend_healthy(BACKEND_URL):
-                    break
-                time.sleep(0.5)
+# Determine active engine mode
+has_remote_api = check_remote_api()
+engine = None if has_remote_api else get_inprocess_engine()
+is_connected = has_remote_api or (engine is not None)
+engine_mode = "FastAPI Backend" if has_remote_api else "Direct Cloud Engine"
 
-ensure_backend_started()
+# Unified Service Functions
+def list_documents() -> List[str]:
+    if has_remote_api:
+        try:
+            r = requests.get(f"{BACKEND_URL}/documents", timeout=3.0)
+            if r.status_code == 200:
+                return r.json().get("documents", [])
+        except Exception:
+            return []
+    elif engine:
+        return engine["search_engine"].get_all_indexed_documents()
+    return []
+
+def delete_document_service(doc_name: str) -> bool:
+    if has_remote_api:
+        try:
+            r = requests.delete(f"{BACKEND_URL}/documents/{doc_name}")
+            return r.status_code == 200
+        except Exception:
+            return False
+    elif engine:
+        try:
+            engine["search_engine"].delete_document(doc_name)
+            target = engine["upload_dir"] / doc_name
+            if target.exists():
+                target.unlink()
+            return True
+        except Exception:
+            return False
+    return False
+
+def upload_and_index_files(uploaded_files) -> tuple[bool, str]:
+    if has_remote_api:
+        files_payload = [("files", (f.name, f.getvalue(), f.type)) for f in uploaded_files]
+        try:
+            res = requests.post(f"{BACKEND_URL}/upload", files=files_payload)
+            if res.status_code == 200:
+                return True, "Documents successfully processed & indexed!"
+            return False, res.json().get("detail", "Upload failed")
+        except Exception as e:
+            return False, str(e)
+    elif engine:
+        try:
+            for f in uploaded_files:
+                file_path = engine["upload_dir"] / f.name
+                with open(file_path, "wb") as buffer:
+                    buffer.write(f.getvalue())
+                chunks = engine["processor"].process_document(str(file_path), f.name)
+                engine["search_engine"].add_documents(chunks)
+            return True, "Documents successfully processed & indexed!"
+        except Exception as e:
+            return False, f"Failed to index files: {e}"
+    return False, "No engine available"
+
+def execute_search_query(query: str, search_type: str, use_reranking: bool, top_k: int) -> dict:
+    if has_remote_api:
+        payload = {
+            "query": query,
+            "search_type": search_type,
+            "use_reranking": use_reranking,
+            "top_k": top_k
+        }
+        res = requests.post(f"{BACKEND_URL}/query", json=payload)
+        if res.status_code == 200:
+            return res.json()
+        return {"answer": f"Error: {res.text}", "sources": []}
+    elif engine:
+        # 1. Retrieval
+        if search_type == "vector":
+            retrieved = engine["search_engine"].vector_search(query)
+        elif search_type == "bm25":
+            retrieved = engine["search_engine"].bm25_search(query)
+        else:
+            retrieved = engine["search_engine"].hybrid_search(query)
+
+        if not retrieved:
+            return {
+                "answer": "I could not find any relevant information in the uploaded documents.",
+                "sources": []
+            }
+
+        # 2. Re-ranking
+        if use_reranking:
+            final_chunks = engine["reranker"].rerank(query, retrieved, top_k=top_k)
+        else:
+            final_chunks = retrieved[:top_k]
+
+        # 3. LLM Synthesis
+        return engine["llm_service"].generate_grounded_answer(query, final_chunks)
+
+    return {"answer": "Search engine is offline.", "sources": []}
 
 # Custom Premium Styling (Dark Theme & Neon Glassmorphism)
 st.markdown("""
 <style>
-    /* Main Background & Fonts */
     @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Space+Grotesk:wght@400;700&display=swap');
     
     html, body, [class*="css"] {
         font-family: 'Outfit', sans-serif;
     }
     
-    /* Title styling */
     .main-title {
         font-family: 'Space Grotesk', sans-serif;
         font-weight: 800;
@@ -74,7 +183,6 @@ st.markdown("""
         margin-bottom: 2rem;
     }
 
-    /* Cards & Glassmorphic Blocks */
     .stat-card {
         background: rgba(25, 30, 45, 0.65);
         border: 1px solid rgba(255, 255, 255, 0.08);
@@ -87,18 +195,17 @@ st.markdown("""
     }
     
     .stat-val {
-        font-size: 2rem;
+        font-size: 1.6rem;
         font-weight: 700;
         color: #00f2fe;
         margin-bottom: 0.2rem;
     }
     
     .stat-label {
-        font-size: 0.9rem;
+        font-size: 0.85rem;
         color: #a0aec0;
     }
 
-    /* Answer box */
     .answer-card {
         background: linear-gradient(135deg, rgba(20, 30, 48, 0.8) 0%, rgba(36, 59, 85, 0.8) 100%);
         border: 1.5px solid rgba(0, 242, 254, 0.3);
@@ -120,7 +227,6 @@ st.markdown("""
         gap: 0.5rem;
     }
     
-    /* Sources style */
     .source-tag {
         display: inline-block;
         background: rgba(0, 242, 254, 0.1);
@@ -143,47 +249,23 @@ st.markdown("""
         font-size: 0.9rem;
         color: #e2e8f0;
     }
-    
-    /* Sidebar adjustments */
-    .sidebar .sidebar-content {
-        background-image: linear-gradient(#141e30, #243b55);
-    }
 </style>
 """, unsafe_allow_html=True)
-
-# Helper function to query backend
-def query_backend_health():
-    try:
-        # Simple test to check if backend is reachable
-        res = requests.get(f"{BACKEND_URL}/documents")
-        return res.status_code == 200
-    except:
-        return False
-
-def get_indexed_documents() -> List[str]:
-    try:
-        res = requests.get(f"{BACKEND_URL}/documents")
-        if res.status_code == 200:
-            return res.json().get("documents", [])
-    except Exception as e:
-        st.error(f"Error fetching documents: {e}")
-    return []
 
 # Layout: Main Panel Title
 st.markdown('<div class="main-title">🧠 Smart Doc Intelligence</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">AI-Powered Hybrid Document Search & RAG System</div>', unsafe_allow_html=True)
 
 # Main Dash Stats
-api_healthy = query_backend_health()
-indexed_docs = get_indexed_documents() if api_healthy else []
+indexed_docs = list_documents() if is_connected else []
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    status_color = "🟢 Connected" if api_healthy else "🔴 Offline"
+    status_label = f"🟢 Connected" if is_connected else "🔴 Offline"
     st.markdown(f"""
     <div class="stat-card">
-        <div class="stat-val">{status_color}</div>
-        <div class="stat-label">FastAPI Backend Status</div>
+        <div class="stat-val">{status_label}</div>
+        <div class="stat-label">Mode: {engine_mode}</div>
     </div>
     """, unsafe_allow_html=True)
 with col2:
@@ -219,22 +301,12 @@ with st.sidebar:
             st.warning("Please select at least one file first.")
         else:
             with st.spinner("Processing documents..."):
-                files_payload = []
-                for f in uploaded_files:
-                    files_payload.append(
-                        ("files", (f.name, f.getvalue(), f.type))
-                    )
-                
-                try:
-                    res = requests.post(f"{BACKEND_URL}/upload", files=files_payload)
-                    if res.status_code == 200:
-                        st.success("Documents successfully processed & indexed!")
-                        # Force refresh
-                        st.rerun()
-                    else:
-                        st.error(f"Failed to process: {res.json().get('detail', 'Unknown error')}")
-                except Exception as e:
-                    st.error(f"Upload failed: {e}")
+                ok, msg = upload_and_index_files(uploaded_files)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(f"Failed to process: {msg}")
                     
     st.markdown("---")
     st.markdown("### ⚙️ Search Configuration")
@@ -264,15 +336,11 @@ with st.sidebar:
             with doc_col2:
                 if st.button("🗑️", key=f"del_{doc}"):
                     with st.spinner(f"Deleting {doc}..."):
-                        try:
-                            res = requests.delete(f"{BACKEND_URL}/documents/{doc}")
-                            if res.status_code == 200:
-                                st.toast(f"Deleted {doc}")
-                                st.rerun()
-                            else:
-                                st.error("Failed to delete document.")
-                        except Exception as e:
-                            st.error(f"Error deleting doc: {e}")
+                        if delete_document_service(doc):
+                            st.toast(f"Deleted {doc}")
+                            st.rerun()
+                        else:
+                            st.error("Failed to delete document.")
 
 # MAIN PANEL: Chat / Search Interface
 st.write("---")
@@ -285,62 +353,50 @@ query = st.text_input(
 )
 
 if query:
-    if not api_healthy:
-        st.error("Cannot execute search: Backend server is unreachable. Please verify that FastAPI backend is running.")
+    if not is_connected:
+        st.error("Engine is currently unavailable.")
     elif not indexed_docs:
         st.warning("No documents indexed yet. Please upload documents in the sidebar first.")
     else:
         with st.spinner("Searching and synthesizing answer..."):
             try:
-                payload = {
-                    "query": query,
-                    "search_type": search_type,
-                    "use_reranking": use_reranking,
-                    "top_k": top_k
-                }
-                res = requests.post(f"{BACKEND_URL}/query", json=payload)
+                data = execute_search_query(query, search_type, use_reranking, top_k)
+                answer = data.get("answer", "")
+                sources = data.get("sources", [])
                 
-                if res.status_code == 200:
-                    data = res.json()
-                    answer = data.get("answer", "")
-                    sources = data.get("sources", [])
-                    
-                    # Display Answer (sanitize to prevent XSS)
-                    safe_answer = html.escape(answer)
-                    st.markdown(f"""
-                    <div class="answer-card">
-                        <div class="answer-header">🤖 Answer</div>
-                        <div style="font-size: 1.1rem; line-height: 1.6; color: #f7fafc; white-space: pre-wrap;">
-                            {safe_answer}
-                        </div>
+                # Display Answer (sanitize to prevent XSS)
+                safe_answer = html.escape(answer)
+                st.markdown(f"""
+                <div class="answer-card">
+                    <div class="answer-header">🤖 Answer</div>
+                    <div style="font-size: 1.1rem; line-height: 1.6; color: #f7fafc; white-space: pre-wrap;">
+                        {safe_answer}
                     </div>
-                    """, unsafe_allow_html=True)
-                    
-                    # Display Source Citations
-                    if sources:
-                        st.markdown("#### 📚 Grounding Source Snippets")
-                        # Remove duplicate snippets for cleaner listing
-                        seen_snippets = set()
-                        unique_sources = []
-                        for src in sources:
-                            if src['text_snippet'] not in seen_snippets:
-                                seen_snippets.add(src['text_snippet'])
-                                unique_sources.append(src)
-                                
-                        for idx, src in enumerate(unique_sources):
-                            safe_source = html.escape(str(src['source']))
-                            safe_page = html.escape(str(src['page']))
-                            safe_snippet = html.escape(str(src['text_snippet']))
-                            st.markdown(f"""
-                            <div class="stat-card" style="background: rgba(255, 255, 255, 0.02); margin-bottom: 0.75rem;">
-                                <span class="source-tag">📄 {safe_source}</span>
-                                <span class="source-tag" style="background: rgba(128, 90, 213, 0.1); border-color: rgba(128, 90, 213, 0.3); color: #b7791f;">Page {safe_page}</span>
-                                <div class="source-snippet">
-                                    "{safe_snippet}"
-                                </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Display Source Citations
+                if sources:
+                    st.markdown("#### 📚 Grounding Source Snippets")
+                    seen_snippets = set()
+                    unique_sources = []
+                    for src in sources:
+                        if src.get('text_snippet') and src['text_snippet'] not in seen_snippets:
+                            seen_snippets.add(src['text_snippet'])
+                            unique_sources.append(src)
+                            
+                    for idx, src in enumerate(unique_sources):
+                        safe_source = html.escape(str(src.get('source', 'Unknown')))
+                        safe_page = html.escape(str(src.get('page', '1')))
+                        safe_snippet = html.escape(str(src.get('text_snippet', '')))
+                        st.markdown(f"""
+                        <div class="stat-card" style="background: rgba(255, 255, 255, 0.02); margin-bottom: 0.75rem;">
+                            <span class="source-tag">📄 {safe_source}</span>
+                            <span class="source-tag" style="background: rgba(128, 90, 213, 0.1); border-color: rgba(128, 90, 213, 0.3); color: #b7791f;">Page {safe_page}</span>
+                            <div class="source-snippet">
+                                "{safe_snippet}"
                             </div>
-                            """, unsafe_allow_html=True)
-                else:
-                    st.error(f"Error querying: {res.json().get('detail', 'Unknown error')}")
+                        </div>
+                        """, unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Search failed: {e}")
