@@ -5,6 +5,11 @@ import os
 import pandas as pd
 from typing import List, Dict, Any
 
+import subprocess
+import time
+import socket
+import sys
+
 # Page Configuration
 st.set_page_config(
     page_title="Smart Doc Intelligence | Hybrid RAG",
@@ -15,6 +20,32 @@ st.set_page_config(
 
 # API Configurations
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+
+def is_backend_healthy(url="http://localhost:8000"):
+    try:
+        r = requests.get(f"{url}/documents", timeout=1.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+@st.cache_resource
+def ensure_backend_started():
+    """If running on local/Streamlit Cloud with default localhost URL, ensure backend is started."""
+    if "localhost" in BACKEND_URL or "127.0.0.1" in BACKEND_URL:
+        if not is_backend_healthy(BACKEND_URL):
+            # Run FastAPI backend in the background
+            subprocess.Popen(
+                [sys.executable, "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            # Wait for backend to be ready
+            for _ in range(12):
+                if is_backend_healthy(BACKEND_URL):
+                    break
+                time.sleep(0.5)
+
+ensure_backend_started()
 
 # Custom Premium Styling (Dark Theme & Neon Glassmorphism)
 st.markdown("""
