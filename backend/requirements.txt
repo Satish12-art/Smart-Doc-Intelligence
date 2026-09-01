@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+qdrant-client
+rank-bm25
+google-generativeai
+pymupdf
+python-docx
+pandas
+numpy
+pydantic
+pydantic-settings
+cohere
+sentence-transformers
